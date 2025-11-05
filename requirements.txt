@@ -1,6 +1,6 @@
 streamlit>=1.28.0
-PyMuPDF>=1.23.0
+pymupdf>=1.23.0
 Pillow>=10.0.0
 numpy>=1.24.0
-img2pdf>=0.4.0
 python-docx>=0.8.11
+reportlab>=4.0.0
