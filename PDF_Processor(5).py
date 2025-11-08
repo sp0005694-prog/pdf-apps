@@ -409,9 +409,28 @@ if uploaded_pdf:
             st.success(f"✅ Processed {len(st.session_state.processed_images)} pages!")
 
     # Display preview if images are available
-    if st.session_state.all_page_images:
-        st.subheader("📄 PDF Preview")
-        page_num = st.slider("Select page to preview", 1, len(st.session_state.all_page_images), 1)
+    # Display preview if images are available
+if st.session_state.all_page_images and len(st.session_state.all_page_images) > 1:
+    st.subheader("📄 PDF Preview")
+    page_num = st.slider("Select page to preview", 1, len(st.session_state.all_page_images), 1)
+    preview_image = st.session_state.all_page_images[page_num-1]
+    
+    # Create grid overlay
+    grid_overlay = create_grid_overlay(preview_image)
+    
+    # Combine original with grid
+    combined = Image.alpha_composite(preview_image.convert('RGBA'), grid_overlay)
+    st.image(combined, caption=f"Page {page_num} with coordinate grid", use_column_width=True)
+elif st.session_state.all_page_images and len(st.session_state.all_page_images) == 1:
+    st.subheader("📄 PDF Preview")
+    preview_image = st.session_state.all_page_images[0]
+    
+    # Create grid overlay
+    grid_overlay = create_grid_overlay(preview_image)
+    
+    # Combine original with grid
+    combined = Image.alpha_composite(preview_image.convert('RGBA'), grid_overlay)
+    st.image(combined, caption="Page 1 with coordinate grid", use_column_width=True)
         preview_image = st.session_state.all_page_images[page_num-1]
         
         # Create grid overlay
