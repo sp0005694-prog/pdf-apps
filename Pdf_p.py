@@ -403,10 +403,18 @@ def visual_logo_selection(image, logo_states):
                     st.rerun()
             
             with action_cols[2]:
-                if st.button("🎯 Auto-Space Logos", use_container_width=True):
-                    img_w, img_h = image.width, image.height
-                    logo_width, logo_height = 100, 50
-                    spacing_x = (img_w - (4 * logo_width)) // 5
-                    spacing_y = (img_h - logo_height) // 2
-                    
-                    for i in range(1, 5):  # Only auto-space recta
+    if st.button("🎯 Auto-Space Logos", use_container_width=True):
+        img_w, img_h = image.width, image.height
+        logo_width, logo_height = 100, 50
+        spacing_x = (img_w - (4 * logo_width)) // 5
+        spacing_y = (img_h - logo_height) // 2
+        
+        for i in range(1, 5):  # Only auto-space rectangles
+            if logo_enabled[i] and logo_types[i] == "rectangle":
+                x1 = spacing_x + (i-1) * (logo_width + spacing_x)
+                y1 = spacing_y
+                st.session_state[f'logo{i}_x1'] = x1
+                st.session_state[f'logo{i}_y1'] = y1
+                st.session_state[f'logo{i}_x2'] = x1 + logo_width
+                st.session_state[f'logo{i}_y2'] = y1 + logo_height
+        st.rerun()
