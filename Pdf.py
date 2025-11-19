@@ -1,0 +1,1224 @@
+import streamlit as st
+import fitz  # PyMuPDF
+from PIL import Image, ImageDraw
+import numpy as np
+import io
+import zipfile
+from pathlib import Path
+import tempfile
+import os
+import time
+
+# Try to import reportlab for PDF creation
+try:
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import letter, A4
+    from reportlab.lib.utils import ImageReader
+    REPORTLAB_AVAILABLE = True
+except ImportError:
+    REPORTLAB_AVAILABLE = False
+
+# Try to import python-docx, but make it optional
+try:
+    from docx import Document
+    from docx.shared import Inches, Pt, Cm
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.section import WD_ORIENT
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    DOCX_AVAILABLE = True
+except ImportError:
+    DOCX_AVAILABLE = False
+
+st.set_page_config(page_title="PDF Image Processor 1.3", layout="wide")
+
+st.title("🔄 PDF Image Processor 1.3")
+st.markdown("**High Quality + Single Column Word + Smart Page Splitting**")
+
+if not REPORTLAB_AVAILABLE:
+    st.sidebar.warning("⚠️ PDF export requires: `pip install reportlab`")
+if not DOCX_AVAILABLE:
+    st.sidebar.warning("⚠️ Word export requires: `pip install python-docx`")
+
+def get_all_page_images(pdf_file, dpi=300):
+    """Extract all pages as high-quality images"""
+    try:
+        pdf_data = pdf_file.getvalue()
+        doc = fitz.open(stream=pdf_data, filetype="pdf")
+        page_images = []
+        
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            # Use high DPI for better quality
+            mat = fitz.Matrix(dpi/72, dpi/72)  # Scale for high resolution
+            pix = page.get_pixmap(matrix=mat)
+            
+            # Use PNG format to preserve quality
+            img_data = pix.tobytes("png")
+            pil_image = Image.open(io.BytesIO(img_data))
+            page_images.append(pil_image)
+        
+        doc.close()
+        return page_images
+    except Exception as e:
+        st.error(f"Error extracting PDF pages: {str(e)}")
+        return []
+
+def create_grid_overlay(image, grid_size=50):
+    """Create a visible grid overlay image with coordinates"""
+    try:
+        # Create a semi-transparent overlay
+        overlay = Image.new('RGBA', image.size, (255, 255, 255, 0))
+        draw = ImageDraw.Draw(overlay)
+        
+        # Colors for better visibility
+        grid_color = (0, 100, 255, 180)  # Blue with good opacity
+        text_color = (0, 0, 0, 255)      # Solid black for text
+        center_color = (255, 0, 0, 220)  # Solid red for center lines
+        
+        # Draw vertical lines
+        for x in range(0, image.width, grid_size):
+            draw.line([(x, 0), (x, image.height)], fill=grid_color, width=2)
+            # Add coordinate text at top (with background for readability)
+            text = str(x)
+            bbox = draw.textbbox((0, 0), text)
+            text_width = bbox[2] - bbox[0]
+            draw.rectangle([x, 0, x + text_width + 4, 15], fill=(255, 255, 255, 200))
+            draw.text((x + 2, 2), text, fill=text_color)
+        
+        # Draw horizontal lines
+        for y in range(0, image.height, grid_size):
+            draw.line([(0, y), (image.width, y)], fill=grid_color, width=2)
+            # Add coordinate text at left (with background for readability)
+            text = str(y)
+            bbox = draw.textbbox((0, 0), text)
+            text_width = bbox[2] - bbox[0]
+            draw.rectangle([0, y, text_width + 4, y + 15], fill=(255, 255, 255, 200))
+            draw.text((2, y + 2), text, fill=text_color)
+        
+        # Draw prominent center lines
+        center_x = image.width // 2
+        center_y = image.height // 2
+        draw.line([(center_x, 0), (center_x, image.height)], fill=center_color, width=3)
+        draw.line([(0, center_y), (image.width, center_y)], fill=center_color, width=3)
+        
+        # Add center coordinates with background
+        center_text = f"Center: ({center_x}, {center_y})"
+        bbox = draw.textbbox((0, 0), center_text)
+        text_width = bbox[2] - bbox[0]
+        draw.rectangle([center_x + 5, center_y + 5, center_x + text_width + 10, center_y + 20], 
+                      fill=(255, 255, 255, 230))
+        draw.text((center_x + 7, center_y + 7), center_text, fill=(255, 0, 0, 255))
+        
+        return overlay
+    except Exception as e:
+        st.error(f"Error creating grid overlay: {str(e)}")
+        return Image.new('RGBA', image.size, (255, 255, 255, 0))
+
+def draw_polygon_preview(draw, points, color, label):
+    """Draw polygon with label and vertex markers"""
+    try:
+        if len(points) < 2:
+            return
+        
+        # Draw polygon outline
+        if len(points) >= 3:
+            draw.polygon(points, outline=color, width=3)
+        
+        # Draw connecting lines
+        for i in range(len(points)):
+            start_point = points[i]
+            end_point = points[(i + 1) % len(points)]
+            draw.line([start_point, end_point], fill=color, width=2)
+        
+        # Draw vertex points and numbers
+        for i, (x, y) in enumerate(points):
+            # Draw vertex circle
+            draw.ellipse([x-4, y-4, x+4, y+4], fill=color, outline=(255, 255, 255), width=1)
+            # Draw vertex number
+            draw.text((x+6, y-10), str(i+1), fill=color)
+        
+        # Draw label at first point
+        if points:
+            label_x, label_y = points[0]
+            draw.text((label_x, label_y-25), label, fill=color)
+    except Exception as e:
+        st.error(f"Error drawing polygon preview: {str(e)}")
+
+def visual_logo_selection(image, logo_states):
+    """Visual logo selection with interactive coordinate selection"""
+    try:
+        st.subheader("🎯 Logo Area Setup (6 Boxes: 4 Rectangle + 2 Polygon)")
+        
+        # Page selection for visual reference
+        if 'all_page_images' in st.session_state:
+            page_options = list(range(1, len(st.session_state.all_page_images) + 1))
+            selected_page = st.selectbox(
+                "Select Page for Visual Reference:",
+                page_options,
+                index=0,
+                help="Select which page to use for setting logo coordinates. Coordinates will apply to ALL pages."
+            )
+            
+            # Update image to selected page
+            image = st.session_state.all_page_images[selected_page - 1]
+            st.info(f"📄 Using Page {selected_page} for reference. Logo coordinates will apply to all {len(st.session_state.all_page_images)} pages.")
+        
+        # Grid settings
+        st.subheader("🗺️ Grid Settings")
+        grid_col1, grid_col2, grid_col3 = st.columns(3)
+        with grid_col1:
+            show_grid = st.toggle("Show Grid Overlay", value=True, help="Display grid lines for easier coordinate selection")
+        with grid_col2:
+            grid_size = st.slider("Grid Size (pixels)", min_value=25, max_value=200, value=50, 
+                                 help="Distance between grid lines")
+        with grid_col3:
+            grid_opacity = st.slider("Grid Opacity", min_value=50, max_value=100, value=80,
+                                    help="Grid visibility level") / 100.0
+        
+        # Create display image with optional grid
+        display_img = image.copy().convert('RGBA')
+        if show_grid:
+            grid_overlay = create_grid_overlay(image, grid_size)
+            # Adjust opacity
+            if grid_opacity < 1.0:
+                grid_overlay = grid_overlay.convert('RGBA')
+                data = np.array(grid_overlay)
+                data[..., 3] = (data[..., 3] * grid_opacity).astype(np.uint8)
+                grid_overlay = Image.fromarray(data)
+            
+            display_img = Image.alpha_composite(display_img, grid_overlay)
+        
+        # Display the reference image
+        st.image(display_img, caption="Reference Image with Grid - Click buttons below to set logo areas", use_column_width=True)
+        
+        # Interactive Point Selection
+        st.subheader("🎯 Interactive Area Selection")
+        st.info("**Click the buttons below to set logo areas at common positions**")
+        
+        point_cols = st.columns(4)
+        click_points = {}
+        
+        with point_cols[0]:
+            if st.button("📍 Top-Left Area", use_container_width=True):
+                click_points = {"x1": 10, "y1": 10, "x2": 110, "y2": 60}
+        with point_cols[1]:
+            if st.button("📍 Top-Right Area", use_container_width=True):
+                click_points = {"x1": image.width-120, "y1": 10, "x2": image.width-20, "y2": 60}
+        with point_cols[2]:
+            if st.button("📍 Bottom-Left Area", use_container_width=True):
+                click_points = {"x1": 10, "y1": image.height-70, "x2": 110, "y2": image.height-20}
+        with point_cols[3]:
+            if st.button("📍 Bottom-Right Area", use_container_width=True):
+                click_points = {"x1": image.width-120, "y1": image.height-70, "x2": image.width-20, "y2": image.height-20}
+        
+        # Apply clicked points to Logo 1
+        if click_points and not st.session_state.get('logo1_coords'):
+            st.session_state.logo1_x1 = click_points["x1"]
+            st.session_state.logo1_y1 = click_points["y1"]
+            st.session_state.logo1_x2 = click_points["x2"]
+            st.session_state.logo1_y2 = click_points["y2"]
+            st.session_state.logo1_enabled = True
+            st.success("✅ Logo 1 area set! Adjust coordinates below or set other logos.")
+        
+        # Coordinate Boxes Section
+        st.subheader("📐 Coordinate Controls")
+        
+        # Create 6 columns for logo toggles (4 rectangle + 2 polygon)
+        toggle_cols = st.columns(6)
+        logo_enabled = {}
+        logo_types = {}
+        
+        # Rectangle logos (1-4)
+        for i in range(1, 5):
+            with toggle_cols[i-1]:
+                logo_enabled[i] = st.toggle(f"Logo {i} (Rect)", 
+                                          value=logo_states[f'logo{i}_enabled'],
+                                          key=f"logo{i}_toggle")
+                logo_types[i] = "rectangle"
+        
+        # Polygon logos (5-6)
+        for i in range(5, 7):
+            with toggle_cols[i-1]:
+                logo_enabled[i] = st.toggle(f"Logo {i} (Polygon)", 
+                                          value=logo_states[f'logo{i}_enabled'],
+                                          key=f"logo{i}_toggle")
+                logo_types[i] = "polygon"
+        
+        # Logo coordinate inputs
+        logo_coords = {}
+        colors = ["red", "blue", "green", "orange", "purple", "brown"]
+        
+        for i in range(1, 7):
+            if logo_enabled[i]:
+                if logo_types[i] == "rectangle":
+                    with st.expander(f"🎯 Logo {i} - Rectangle ({colors[i-1].title()})", expanded=True):
+                        cols = st.columns(4)
+                        
+                        with cols[0]:
+                            x1 = st.number_input(f"Left (X1)", 
+                                               min_value=0, max_value=image.width,
+                                               value=logo_states[f'logo{i}_coords'][0] if logo_states[f'logo{i}_coords'] else 50 + (i-1)*30,
+                                               key=f"logo{i}_x1")
+                        with cols[1]:
+                            y1 = st.number_input(f"Top (Y1)", 
+                                               min_value=0, max_value=image.height,
+                                               value=logo_states[f'logo{i}_coords'][1] if logo_states[f'logo{i}_coords'] else 50 + (i-1)*40,
+                                               key=f"logo{i}_y1")
+                        with cols[2]:
+                            x2 = st.number_input(f"Right (X2)", 
+                                               min_value=0, max_value=image.width,
+                                               value=logo_states[f'logo{i}_coords'][2] if logo_states[f'logo{i}_coords'] else 150 + (i-1)*30,
+                                               key=f"logo{i}_x2")
+                        with cols[3]:
+                            y2 = st.number_input(f"Bottom (Y2)", 
+                                               min_value=0, max_value=image.height,
+                                               value=logo_states[f'logo{i}_coords'][3] if logo_states[f'logo{i}_coords'] else 100 + (i-1)*40,
+                                               key=f"logo{i}_y2")
+                        
+                        # Ensure valid coordinates
+                        if x2 <= x1:
+                            x2 = x1 + 10
+                        if y2 <= y1:
+                            y2 = y1 + 10
+                        
+                        logo_coords[i] = (x1, y1, x2, y2)
+                        
+                        # Show coordinate summary
+                        st.success(f"Logo {i}: ({x1}, {y1}) to ({x2}, {y2}) | Size: {x2-x1}×{y2-y1} pixels")
+                
+                else:  # polygon
+                    with st.expander(f"🔷 Logo {i} - Freeform Polygon ({colors[i-1].title()})", expanded=True):
+                        # Polygon points configuration
+                        num_points = st.slider(f"Number of Polygon Points", 
+                                             min_value=3, max_value=8, value=4,
+                                             key=f"polygon{i}_points")
+                        
+                        st.info(f"Configure {num_points} points for the polygon:")
+                        
+                        # Dynamic point inputs
+                        polygon_points = []
+                        point_cols = st.columns(2)
+                        
+                        for point_idx in range(num_points):
+                            col_idx = point_idx % 2
+                            with point_cols[col_idx]:
+                                st.markdown(f"**Point {point_idx + 1}**")
+                                x = st.number_input(f"X{point_idx + 1}", 
+                                                  min_value=0, max_value=image.width,
+                                                  value=100 + point_idx * 20,
+                                                  key=f"polygon{i}_point{point_idx}_x")
+                                y = st.number_input(f"Y{point_idx + 1}", 
+                                                  min_value=0, max_value=image.height,
+                                                  value=100 + point_idx * 15,
+                                                  key=f"polygon{i}_point{point_idx}_y")
+                                polygon_points.append((x, y))
+                        
+                        logo_coords[i] = tuple(polygon_points)
+                        
+                        # Show polygon summary
+                        points_str = " → ".join([f"({x},{y})" for x, y in polygon_points])
+                        st.success(f"Logo {i}: {num_points}-sided polygon | Points: {points_str}")
+        
+        # Real-time Preview Section
+        st.subheader("👁️ Live Preview")
+        
+        # Create preview image with grid
+        preview_img = image.copy().convert('RGBA')
+        if show_grid:
+            grid_overlay = create_grid_overlay(image, grid_size)
+            # Adjust opacity
+            if grid_opacity < 1.0:
+                grid_overlay = grid_overlay.convert('RGBA')
+                data = np.array(grid_overlay)
+                data[..., 3] = (data[..., 3] * grid_opacity).astype(np.uint8)
+                grid_overlay = Image.fromarray(data)
+            
+            preview_img = Image.alpha_composite(preview_img, grid_overlay)
+        
+        draw = ImageDraw.Draw(preview_img)
+        
+        active_logos = []
+        for i in range(1, 7):
+            if logo_enabled[i] and logo_coords.get(i):
+                if logo_types[i] == "rectangle":
+                    x1, y1, x2, y2 = logo_coords[i]
+                    # Draw rectangle box with thick border
+                    draw.rectangle([x1, y1, x2, y2], outline=colors[i-1], width=4)
+                    # Add label with background
+                    label = f"LOGO {i}"
+                    bbox = draw.textbbox((0, 0), label)
+                    text_width = bbox[2] - bbox[0]
+                    draw.rectangle([x1, y1-30, x1 + text_width + 6, y1-10], fill=(255, 255, 255, 200))
+                    draw.text((x1+3, y1-28), label, fill=colors[i-1])
+                    # Add size info with background
+                    size_text = f"{x2-x1}×{y2-y1}"
+                    bbox = draw.textbbox((0, 0), size_text)
+                    text_width = bbox[2] - bbox[0]
+                    draw.rectangle([x1, y2+2, x1 + text_width + 6, y2+22], fill=(255, 255, 255, 200))
+                    draw.text((x1+3, y2+4), size_text, fill=colors[i-1])
+                    active_logos.append(f"Logo {i} (Rect)")
+                    
+                else:  # polygon
+                    points = logo_coords[i]
+                    if len(points) >= 3:
+                        draw_polygon_preview(draw, points, colors[i-1], f"LOGO {i}")
+                        active_logos.append(f"Logo {i} (Polygon)")
+        
+        st.image(preview_img, caption="🔴 Logo 1 | 🔵 Logo 2 | 🟢 Logo 3 | 🟠 Logo 4 | 🟣 Logo 5 | 🟤 Logo 6", use_column_width=True)
+        
+        # Quick Actions
+        if any(logo_enabled.values()):
+            st.subheader("⚡ Quick Actions")
+            action_cols = st.columns(3)
+            
+            with action_cols[0]:
+                if st.button("📋 Copy Logo 1 to Others", use_container_width=True):
+                    if logo_enabled[1] and logo_coords.get(1) and logo_types[1] == "rectangle":
+                        base_x1, base_y1, base_x2, base_y2 = logo_coords[1]
+                        for i in range(2, 5):  # Only copy to other rectangles
+                            if logo_enabled[i] and logo_types[i] == "rectangle":
+                                offset = (i-1) * 20
+                                st.session_state[f'logo{i}_x1'] = base_x1 + offset
+                                st.session_state[f'logo{i}_y1'] = base_y1 + offset
+                                st.session_state[f'logo{i}_x2'] = base_x2 + offset
+                                st.session_state[f'logo{i}_y2'] = base_y2 + offset
+                        st.rerun()
+            
+            with action_cols[1]:
+                if st.button("🔄 Reset All Positions", use_container_width=True):
+                    for i in range(1, 7):
+                        if logo_enabled[i]:
+                            if logo_types[i] == "rectangle":
+                                st.session_state[f'logo{i}_x1'] = 50 + (i-1)*30
+                                st.session_state[f'logo{i}_y1'] = 50 + (i-1)*40
+                                st.session_state[f'logo{i}_x2'] = 150 + (i-1)*30
+                                st.session_state[f'logo{i}_y2'] = 100 + (i-1)*40
+                            else:  # polygon
+                                # Reset polygon points to default positions
+                                num_points = st.session_state.get(f'polygon{i}_points', 4)
+                                for point_idx in range(num_points):
+                                    st.session_state[f'polygon{i}_point{point_idx}_x'] = 100 + point_idx * 20
+                                    st.session_state[f'polygon{i}_point{point_idx}_y'] = 100 + point_idx * 15
+                    st.rerun()
+            
+            with action_cols[2]:
+                if st.button("🎯 Auto-Space Logos", use_container_width=True):
+                    img_w, img_h = image.width, image.height
+                    logo_width, logo_height = 100, 50
+                    spacing_x = (img_w - (4 * logo_width)) // 5
+                    spacing_y = (img_h - logo_height) // 2
+                    
+                    for i in range(1, 5):  # Only auto-space rectangles
+                        if logo_enabled[i] and logo_types[i] == "rectangle":
+                            x1 = spacing_x + (i-1) * (logo_width + spacing_x)
+                            y1 = spacing_y
+                            st.session_state[f'logo{i}_x1'] = x1
+                            st.session_state[f'logo{i}_y1'] = y1
+                            st.session_state[f'logo{i}_x2'] = x1 + logo_width
+                            st.session_state[f'logo{i}_y2'] = y1 + logo_height
+                    st.rerun()
+        
+        # Status and confirmation
+        if active_logos:
+            st.success(f"✅ Active logos: {', '.join(active_logos)}")
+            st.info("💡 **Tip**: Use the grid overlay and click buttons for quick setup, then fine-tune with coordinate boxes")
+        else:
+            st.warning("⚠️ No logos enabled - no logo removal will be performed")
+        
+        if st.button("✅ Confirm All Logo Areas", type="primary"):
+            # Update session state
+            for i in range(1, 7):
+                st.session_state[f'logo{i}_enabled'] = logo_enabled[i]
+                if logo_enabled[i]:
+                    st.session_state[f'logo{i}_coords'] = logo_coords[i]
+                    st.session_state[f'logo{i}_type'] = logo_types[i]
+                else:
+                    st.session_state[f'logo{i}_coords'] = None
+                    st.session_state[f'logo{i}_type'] = None
+            
+            st.balloons()
+            st.success("🎉 All logo areas confirmed! Ready to process PDF.")
+            return True
+        
+        return False
+    except Exception as e:
+        st.error(f"Error in logo selection: {str(e)}")
+        return False
+
+def remove_logo_precise(image, logo_coords, logo_type, method="white"):
+    """Remove logo with precise coordinates - supports both rectangle and polygon"""
+    if logo_coords is None:
+        return image
+    
+    # Create copy
+    result_img = image.copy()
+    draw = ImageDraw.Draw(result_img)
+    
+    if logo_type == "rectangle":
+        x1, y1, x2, y2 = logo_coords
+        
+        if method == "white":
+            # Simple white fill
+            draw.rectangle([x1, y1, x2, y2], fill=(255, 255, 255))
+        else:
+            # Sample background around logo
+            img_array = np.array(image)
+            
+            # Get samples from all sides
+            samples = []
+            
+            # Top sample
+            if y1 > 10:
+                top_sample = img_array[max(0, y1-10):y1, x1:x2]
+                if top_sample.size > 0:
+                    samples.append(np.mean(top_sample, axis=(0, 1)))
+            
+            # Bottom sample  
+            if y2 < image.height - 10:
+                bottom_sample = img_array[y2:min(image.height, y2+10), x1:x2]
+                if bottom_sample.size > 0:
+                    samples.append(np.mean(bottom_sample, axis=(0, 1)))
+            
+            # Left sample
+            if x1 > 10:
+                left_sample = img_array[y1:y2, max(0, x1-10):x1]
+                if left_sample.size > 0:
+                    samples.append(np.mean(left_sample, axis=(0, 1)))
+            
+            # Right sample
+            if x2 < image.width - 10:
+                right_sample = img_array[y1:y2, x2:min(image.width, x2+10)]
+                if right_sample.size > 0:
+                    samples.append(np.mean(right_sample, axis=(0, 1)))
+            
+            if samples:
+                fill_color = tuple(np.mean(samples, axis=0).astype(int))
+            else:
+                fill_color = (255, 255, 255)  # Fallback to white
+            
+            draw.rectangle([x1, y1, x2, y2], fill=fill_color)
+    
+    else:  # polygon
+        points = logo_coords
+        if len(points) >= 3:
+            if method == "white":
+                # Simple white fill for polygon
+                draw.polygon(points, fill=(255, 255, 255))
+            else:
+                # For polygons, use white fill (smart fill is complex for polygons)
+                draw.polygon(points, fill=(255, 255, 255))
+    
+    return result_img
+
+def crop_vertical_only(image, white_threshold=245):
+    """Crop only top and bottom white borders - INDIVIDUAL per image"""
+    img_array = np.array(image)
+    
+    if len(img_array.shape) == 3:
+        non_white_mask = np.any(img_array < white_threshold, axis=(1, 2))
+    else:
+        non_white_mask = np.any(img_array < white_threshold, axis=1)
+    
+    non_white_rows = np.where(non_white_mask)[0]
+    if len(non_white_rows) == 0:
+        return image
+    
+    y_min = non_white_rows[0]
+    y_max = non_white_rows[-1]
+    
+    margin = 5
+    y_min = max(0, y_min - margin)
+    y_max = min(image.height, y_max + 1 + margin)
+    
+    return image.crop((0, y_min, image.width, y_max))
+
+def crop_horizontal_only(image, white_threshold=245):
+    """Crop only left and right white borders - INDIVIDUAL per image"""
+    img_array = np.array(image)
+    
+    if len(img_array.shape) == 3:
+        non_white_mask = np.any(img_array < white_threshold, axis=(0, 1))
+    else:
+        non_white_mask = np.any(img_array < white_threshold, axis=0)
+    
+    non_white_cols = np.where(non_white_mask)[0]
+    if len(non_white_cols) == 0:
+        return image
+    
+    x_min = non_white_cols[0]
+    x_max = non_white_cols[-1]
+    
+    margin = 5
+    x_min = max(0, x_min - margin)
+    x_max = min(image.width, x_max + 1 + margin)
+    
+    return image.crop((x_min, 0, x_max, image.height))
+
+def crop_both_fixed(image, white_threshold=245):
+    """FIXED: Crop both vertical and horizontal - INDIVIDUAL per image"""
+    img_array = np.array(image)
+    
+    # Create a unified mask of non-white areas for THIS specific image
+    if len(img_array.shape) == 3:
+        # For RGB images: pixel is white if ALL channels are above threshold
+        white_mask = np.all(img_array >= white_threshold, axis=2)
+    else:
+        # For grayscale images
+        white_mask = img_array >= white_threshold
+    
+    # Find coordinates of non-white pixels (actual content)
+    non_white_coords = np.where(~white_mask)
+    
+    # If no content found (completely white image), return original
+    if len(non_white_coords[0]) == 0:
+        return image
+    
+    # Find the bounding box of actual content for THIS image
+    y_min, y_max = np.min(non_white_coords[0]), np.max(non_white_coords[0])
+    x_min, x_max = np.min(non_white_coords[1]), np.max(non_white_coords[1])
+    
+    # Add small margin
+    margin = 5
+    y_min = max(0, y_min - margin)
+    y_max = min(image.height, y_max + 1 + margin)
+    x_min = max(0, x_min - margin)
+    x_max = min(image.width, x_max + 1 + margin)
+    
+    # Crop to the content area
+    return image.crop((x_min, y_min, x_max, y_max))
+
+def process_pdf_with_logos(pdf_file, logo_states, white_threshold, removal_method, cropping_method, main_progress, sub_progress, time_tracker):
+    """Process all pages with logo removal and cropping with detailed progress"""
+    processed_images = []
+    
+    pdf_data = pdf_file.getvalue()
+    doc = fitz.open(stream=pdf_data, filetype="pdf")
+    total_pages = len(doc)
+    
+    start_time = time.time()
+    
+    for page_num in range(total_pages):
+        # Update main progress
+        main_progress.progress((page_num) / total_pages, text=f"🔄 Processing page {page_num + 1}/{total_pages}")
+        
+        page = doc[page_num]
+        # Use high DPI for processing to maintain quality
+        mat = fitz.Matrix(300/72, 300/72)  # High resolution processing
+        pix = page.get_pixmap(matrix=mat)
+        
+        # Use PNG format to preserve quality
+        img_data = pix.tobytes("png")
+        pil_image = Image.open(io.BytesIO(img_data))
+        
+        # Step 1: Logo Removal (all 6 logos)
+        sub_progress.progress(0.2, text=f"Removing logos...")
+        for i in range(1, 7):
+            if logo_states[f'logo{i}_enabled'] and logo_states[f'logo{i}_coords']:
+                logo_type = logo_states.get(f'logo{i}_type', 'rectangle')
+                pil_image = remove_logo_precise(pil_image, logo_states[f'logo{i}_coords'], logo_type, removal_method)
+        
+        # Step 2: Cropping
+        sub_progress.progress(0.6, text=f"Cropping image...")
+        if cropping_method == "vertical":
+            pil_image = crop_vertical_only(pil_image, white_threshold)
+        elif cropping_method == "horizontal":
+            pil_image = crop_horizontal_only(pil_image, white_threshold)
+        elif cropping_method == "both":
+            pil_image = crop_both_fixed(pil_image, white_threshold)
+        # else "none" - no cropping
+        
+        # Step 3: Finalize
+        sub_progress.progress(1.0, text=f"Finalizing page {page_num + 1}...")
+        processed_images.append(pil_image)
+        
+        # Estimate time remaining
+        elapsed_time = time.time() - start_time
+        pages_processed = page_num + 1
+        time_per_page = elapsed_time / pages_processed
+        remaining_pages = total_pages - pages_processed
+        estimated_remaining = time_per_page * remaining_pages
+        
+        time_tracker.text(f"⏱️ Estimated time remaining: {estimated_remaining:.1f}s")
+        
+        # Reset sub-progress for next page
+        if page_num < total_pages - 1:
+            sub_progress.progress(0.0, text="Ready for next page...")
+    
+    doc.close()
+    return processed_images
+
+def create_pdf_from_images(images):
+    """Create PDF from images using ReportLab - no margins, exact image sizes"""
+    if not REPORTLAB_AVAILABLE:
+        raise ImportError("ReportLab is not installed. Please install with: pip install reportlab")
+    
+    try:
+        if not images:
+            return io.BytesIO().getvalue()
+            
+        buffer = io.BytesIO()
+        
+        # Process first image to create canvas
+        first_img = images[0]
+        first_img_width, first_img_height = first_img.size
+        
+        # Ensure minimum dimensions
+        first_img_width = max(first_img_width, 1)
+        first_img_height = max(first_img_height, 1)
+        
+        c = canvas.Canvas(buffer, pagesize=(first_img_width, first_img_height))
+        
+        # Add first image
+        img_buffer = io.BytesIO()
+        first_img.save(img_buffer, format='PNG')  # Use PNG for quality
+        img_buffer.seek(0)
+        pil_image = ImageReader(img_buffer)
+        c.drawImage(pil_image, 0, 0, width=first_img_width, height=first_img_height)
+        
+        # Add remaining images
+        for i in range(1, len(images)):
+            img = images[i]
+            img_width, img_height = img.size
+            
+            # Ensure minimum dimensions
+            img_width = max(img_width, 1)
+            img_height = max(img_height, 1)
+            
+            c.showPage()
+            c.setPageSize((img_width, img_height))
+            
+            img_buffer = io.BytesIO()
+            img.save(img_buffer, format='PNG')  # Use PNG for quality
+            img_buffer.seek(0)
+            pil_image = ImageReader(img_buffer)
+            c.drawImage(pil_image, 0, 0, width=img_width, height=img_height)
+        
+        c.save()
+        buffer.seek(0)
+        return buffer.getvalue()
+        
+    except Exception as e:
+        raise Exception(f"PDF creation failed: {str(e)}")
+
+def create_word_document_single_column(images, orientation="portrait", margins="normal"):
+    """Create Word document with single column layout and smart page splitting"""
+    if not DOCX_AVAILABLE:
+        raise ImportError("python-docx is not installed. Please run: pip install python-docx")
+    
+    doc = Document()
+    
+    # Configure page layout based on orientation
+    section = doc.sections[0]
+    
+    # Set orientation
+    if orientation == "landscape":
+        section.orientation = WD_ORIENT.LANDSCAPE
+        section.page_width = Cm(29.7)  # A4 landscape
+        section.page_height = Cm(21.0)
+        available_width = Cm(28.0)  # Account for margins
+    else:  # portrait
+        section.orientation = WD_ORIENT.PORTRAIT
+        section.page_width = Cm(21.0)  # A4 portrait
+        section.page_height = Cm(29.7)
+        available_width = Cm(18.0)  # Account for margins
+    
+    # Set margins
+    if margins == "narrow":
+        section.top_margin = Cm(1.27)
+        section.bottom_margin = Cm(1.27)
+        section.left_margin = Cm(1.27)
+        section.right_margin = Cm(1.27)
+        available_height = Cm(26.0) if orientation == "portrait" else Cm(17.5)
+    elif margins == "none":
+        section.top_margin = Cm(0.5)
+        section.bottom_margin = Cm(0.5)
+        section.left_margin = Cm(0.5)
+        section.right_margin = Cm(0.5)
+        available_height = Cm(28.0) if orientation == "portrait" else Cm(19.5)
+    else:  # normal
+        section.top_margin = Cm(2.54)
+        section.bottom_margin = Cm(2.54)
+        section.left_margin = Cm(2.54)
+        section.right_margin = Cm(2.54)
+        available_height = Cm(24.0) if orientation == "portrait" else Cm(15.5)
+    
+    # Remove default paragraph spacing to eliminate gaps
+    style = doc.styles['Normal']
+    style.paragraph_format.space_after = Pt(0)
+    style.paragraph_format.space_before = Pt(0)
+    
+    # Track current page height
+    current_height = Pt(0)
+    
+    for i, image in enumerate(images):
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp_file:
+            image.save(tmp_file.name, 'PNG')
+            tmp_path = tmp_file.name
+        
+        try:
+            # Calculate image dimensions for Word
+            img_width_px, img_height_px = image.size
+            
+            # Calculate width to fit available space while maintaining aspect ratio
+            width_ratio = available_width / Cm(img_width_px * 0.026458)  # Convert pixels to cm
+            target_width = available_width
+            
+            # Calculate corresponding height
+            target_height = Cm(img_height_px * 0.026458) * width_ratio
+            
+            # Check if image fits on current page
+            if current_height + target_height > available_height:
+                # Image doesn't fit, need to split or create new page
+                remaining_height = available_height - current_height
+                
+                if remaining_height > Cm(3):  # If there's significant space left
+                    # Scale image to fit remaining space
+                    scale_factor = remaining_height / target_height
+                    scaled_width = target_width * scale_factor
+                    scaled_height = target_height * scale_factor
+                    
+                    # Add scaled image
+                    para = doc.add_paragraph()
+                    para.paragraph_format.space_after = Pt(0)
+                    para.paragraph_format.space_before = Pt(0)
+                    para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    run = para.add_run()
+                    run.add_picture(tmp_path, width=scaled_width)
+                    
+                    # Create new page for remaining part
+                    doc.add_page_break()
+                    current_height = Pt(0)
+                    
+                    # Add remaining part of the image
+                    para = doc.add_paragraph()
+                    para.paragraph_format.space_after = Pt(0)
+                    para.paragraph_format.space_before = Pt(0)
+                    para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    run = para.add_run()
+                    run.add_picture(tmp_path, width=target_width)
+                    current_height = target_height
+                else:
+                    # Not enough space, create new page and add full image
+                    doc.add_page_break()
+                    current_height = Pt(0)
+                    
+                    para = doc.add_paragraph()
+                    para.paragraph_format.space_after = Pt(0)
+                    para.paragraph_format.space_before = Pt(0)
+                    para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    run = para.add_run()
+                    run.add_picture(tmp_path, width=target_width)
+                    current_height = target_height
+            else:
+                # Image fits on current page
+                para = doc.add_paragraph()
+                para.paragraph_format.space_after = Pt(0)
+                para.paragraph_format.space_before = Pt(0)
+                para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                run = para.add_run()
+                run.add_picture(tmp_path, width=target_width)
+                current_height += target_height
+            
+        finally:
+            os.unlink(tmp_path)
+    
+    return doc
+
+def create_word_document_two_column(images, orientation="portrait", margins="normal"):
+    """Create Word document with two-column layout"""
+    if not DOCX_AVAILABLE:
+        raise ImportError("python-docx is not installed. Please run: pip install python-docx")
+    
+    doc = Document()
+    
+    # Configure page layout based on orientation
+    section = doc.sections[0]
+    
+    # Set orientation
+    if orientation == "landscape":
+        section.orientation = WD_ORIENT.LANDSCAPE
+        section.page_width = Cm(29.7)  # A4 landscape
+        section.page_height = Cm(21.0)
+        image_width = Cm(14.8)
+    else:  # portrait
+        section.orientation = WD_ORIENT.PORTRAIT
+        section.page_width = Cm(21.0)  # A4 portrait
+        section.page_height = Cm(29.7)
+        image_width = Cm(10.0)
+    
+    # Set margins
+    if margins == "narrow":
+        section.top_margin = Cm(1.27)
+        section.bottom_margin = Cm(1.27)
+        section.left_margin = Cm(1.27)
+        section.right_margin = Cm(1.27)
+    elif margins == "none":
+        section.top_margin = Cm(0.5)
+        section.bottom_margin = Cm(0.5)
+        section.left_margin = Cm(0.5)
+        section.right_margin = Cm(0.5)
+    else:  # normal
+        section.top_margin = Cm(2.54)
+        section.bottom_margin = Cm(2.54)
+        section.left_margin = Cm(2.54)
+        section.right_margin = Cm(2.54)
+    
+    # Setup two-column layout
+    sectPr = section._sectPr
+    cols = sectPr.xpath('./w:cols')[0]
+    cols.set(qn('w:num'), '2')
+    cols.set(qn('w:space'), '360')
+    cols.set(qn('w:sep'), 'true')
+    
+    # Remove default paragraph spacing to eliminate gaps
+    style = doc.styles['Normal']
+    style.paragraph_format.space_after = Pt(0)
+    style.paragraph_format.space_before = Pt(0)
+    
+    # Add images in two-column layout
+    for i, image in enumerate(images):
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp_file:
+            image.save(tmp_file.name, 'PNG')
+            tmp_path = tmp_file.name
+        
+        try:
+            para = doc.add_paragraph()
+            
+            # Remove paragraph spacing to eliminate gaps
+            para.paragraph_format.space_after = Pt(0)
+            para.paragraph_format.space_before = Pt(0)
+            
+            para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run = para.add_run()
+            run.add_picture(tmp_path, width=image_width)
+        finally:
+            os.unlink(tmp_path)
+    
+    return doc
+
+# Initialize session state for 6 logos (4 rectangle + 2 polygon)
+for i in range(1, 7):
+    if f'logo{i}_enabled' not in st.session_state:
+        st.session_state[f'logo{i}_enabled'] = False
+    if f'logo{i}_coords' not in st.session_state:
+        st.session_state[f'logo{i}_coords'] = None
+    if f'logo{i}_type' not in st.session_state:
+        st.session_state[f'logo{i}_type'] = "rectangle" if i <= 4 else "polygon"
+if 'all_page_images' not in st.session_state:
+    st.session_state.all_page_images = None
+
+# Main App Flow
+st.sidebar.header("⚙️ PDF Image Processor 1.3")
+
+uploaded_pdf = st.sidebar.file_uploader("1. Upload PDF", type=["pdf"], key="pdf_uploader")
+
+# Word export settings
+word_settings = {}
+if DOCX_AVAILABLE:
+    st.sidebar.subheader("📝 Word Export Settings")
+    word_settings['orientation'] = st.sidebar.radio(
+        "Page Orientation:",
+        ["portrait", "landscape"],
+        format_func=lambda x: f"{x.title()} ({'Max width' if x == 'portrait' else 'Wider images'})"
+    )
+    
+    word_settings['margins'] = st.sidebar.radio(
+        "Page Margins:",
+        ["normal", "narrow", "none"],
+        format_func=lambda x: {
+            "normal": "Normal (1 inch)",
+            "narrow": "Narrow (0.5 inch)", 
+            "none": "Minimal (0.2 inch)"
+        }[x]
+    )
+    
+    word_settings['layout'] = st.sidebar.radio(
+        "Document Layout:",
+        ["single", "two-column"],
+        format_func=lambda x: {
+            "single": "Single Column (Full width + Smart splitting)",
+            "two-column": "Two Column (Compact layout)"
+        }[x]
+    )
+
+if uploaded_pdf:
+    st.sidebar.success("✅ PDF uploaded successfully!")
+    
+    # Extract all pages for logo setup with high quality
+    if st.session_state.all_page_images is None:
+        with st.spinner("Loading PDF pages with high quality..."):
+            st.session_state.all_page_images = get_all_page_images(uploaded_pdf, dpi=300)
+    
+    # Step 1: Logo Setup
+    st.sidebar.subheader("2. Logo Setup")
+    setup_logo = st.sidebar.radio("Logo Removal:", ["No Logo Removal", "6-Logo Setup"])
+    
+    # Step 2: Processing Settings
+    st.sidebar.subheader("3. Processing Settings")
+    white_threshold = st.sidebar.slider("White Threshold", 200, 254, 245)
+    
+    removal_method = st.sidebar.selectbox("Logo Removal Method", 
+                                        ["white", "smart"],
+                                        format_func=lambda x: "White Fill" if x == "white" else "Smart Background Fill",
+                                        help="Note: Smart fill works best with rectangle logos")
+    
+    # Both-direction cropping as default
+    cropping_method = st.sidebar.selectbox(
+        "Cropping Method:",
+        ["both", "vertical", "horizontal", "none"],
+        format_func=lambda x: {
+            "both": "Both Directions (Default)",
+            "vertical": "Vertical Only (top/bottom)", 
+            "horizontal": "Horizontal Only (left/right)",
+            "none": "No Cropping"
+        }[x],
+        index=0  # Default to "both"
+    )
+    
+    # Main content area
+    if setup_logo == "6-Logo Setup":
+        st.header("🎯 Step 2: 6-Logo Visual Setup")
+        
+        st.info("""
+        **Visual Logo Setup:**
+        - **🗺️ Grid Overlay**: Toggle grid lines for precise coordinate selection
+        - **🎯 Click Buttons**: Set logo areas at common positions
+        - **📐 Coordinate Boxes**: Manual precision editing  
+        - **🔷 Polygon Logos**: Freeform shapes for complex logos (Logos 5-6)
+        - **👁️ Live Preview**: Real-time visual feedback with grid
+        - **⚡ Quick Actions**: Copy, reset, auto-space logos
+        """)
+        
+        # Prepare logo states
+        logo_states = {}
+        for i in range(1, 7):
+            logo_states[f'logo{i}_enabled'] = st.session_state[f'logo{i}_enabled']
+            logo_states[f'logo{i}_coords'] = st.session_state[f'logo{i}_coords']
+            logo_states[f'logo{i}_type'] = st.session_state[f'logo{i}_type']
+        
+        # Get first page for reference
+        first_page_img = st.session_state.all_page_images[0]
+        
+        # Visual logo setup
+        visual_logo_selection(first_page_img, logo_states)
+    
+    # Step 3: Process PDF
+    any_logo_enabled = any(st.session_state.get(f'logo{i}_enabled', False) for i in range(1, 7))
+    if setup_logo == "No Logo Removal" or any_logo_enabled:
+        st.header("🚀 Step 3: Process PDF")
+        
+        # Show processing summary
+        if setup_logo == "6-Logo Setup":
+            logo_summary = []
+            for i in range(1, 7):
+                if st.session_state[f'logo{i}_enabled']:
+                    logo_type = st.session_state.get(f'logo{i}_type', 'rectangle')
+                    type_label = "Rect" if logo_type == "rectangle" else "Polygon"
+                    logo_summary.append(f"Logo {i} ({type_label})")
+            
+            if logo_summary:
+                st.info(f"🔧 Will remove: {', '.join(logo_summary)} from all {len(st.session_state.all_page_images)} pages")
+        
+        # Show cropping info
+        st.info(f"🌐 Cropping: **{cropping_method.upper()}** direction{'s' if cropping_method == 'both' else ''}")
+        
+        if st.button("🔄 Process All Pages", type="primary", key="process_btn"):
+            # Create progress containers
+            main_progress = st.progress(0, text="🔄 Starting PDF processing...")
+            sub_progress = st.progress(0, text="Initializing...")
+            time_tracker = st.empty()
+            status_text = st.empty()
+            
+            try:
+                # Prepare logo states for processing
+                logo_states = {}
+                for i in range(1, 7):
+                    logo_states[f'logo{i}_enabled'] = st.session_state.get(f'logo{i}_enabled', False)
+                    logo_states[f'logo{i}_coords'] = st.session_state.get(f'logo{i}_coords')
+                    logo_states[f'logo{i}_type'] = st.session_state.get(f'logo{i}_type', 'rectangle')
+                
+                processed_images = process_pdf_with_logos(
+                    uploaded_pdf, 
+                    logo_states,
+                    white_threshold, 
+                    removal_method, 
+                    cropping_method,
+                    main_progress,
+                    sub_progress,
+                    time_tracker
+                )
+                
+                # Final completion
+                main_progress.progress(1.0, text="✅ Processing complete!")
+                sub_progress.progress(1.0, text="All pages processed successfully")
+                time_tracker.empty()
+                status_text.success("🎉 All pages processed successfully!")
+                
+                st.session_state.processed_images = processed_images
+                st.session_state.processing_done = True
+                
+            except Exception as e:
+                main_progress.empty()
+                sub_progress.empty()
+                time_tracker.empty()
+                st.error(f"❌ Processing failed: {str(e)}")
+    
+    # Show results and downloads
+    if st.session_state.get('processing_done', False):
+        st.header("📊 Results")
+        
+        # Show before/after comparison
+        if any_logo_enabled:
+            st.subheader("Before/After Comparison")
+            original_first_page = st.session_state.all_page_images[0]
+            processed_first_page = st.session_state.processed_images[0]
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.image(original_first_page, caption="BEFORE - Original", use_column_width=True)
+            with col2:
+                st.image(processed_first_page, caption="AFTER - Logo(s) removed + Cropped", use_column_width=True)
+        
+        # Download section
+        st.header("📥 Download Results")
+        
+        # Calculate how many columns we need
+        num_columns = 1  # ZIP is always available
+        if REPORTLAB_AVAILABLE:
+            num_columns += 1
+        if DOCX_AVAILABLE:
+            num_columns += 1
+            
+        cols = st.columns(num_columns)
+        col_index = 0
+        
+        with cols[col_index]:
+            # ZIP download
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, 'w') as zip_file:
+                for i, img in enumerate(st.session_state.processed_images):
+                    img_bytes = io.BytesIO()
+                    img.save(img_bytes, format='PNG')  # Use PNG for quality
+                    zip_file.writestr(f"page_{i+1:03d}.png", img_bytes.getvalue())
+            
+            st.download_button(
+                label="💾 Download as ZIP (High Quality PNG)",
+                data=zip_buffer.getvalue(),
+                file_name="processed_pages.zip",
+                mime="application/zip",
+                use_container_width=True
+            )
+        col_index += 1
+        
+        if REPORTLAB_AVAILABLE:
+            with cols[col_index]:
+                # PDF download using ReportLab
+                try:
+                    with st.spinner("Creating PDF..."):
+                        pdf_bytes = create_pdf_from_images(st.session_state.processed_images)
+                    
+                    st.download_button(
+                        label="📄 Download as PDF (High Quality)",
+                        data=pdf_bytes,
+                        file_name="processed_pages.pdf",
+                        mime="application/pdf",
+                        use_container_width=True
+                    )
+                    st.caption("PDF pages match exact cropped image sizes - no margins")
+                except Exception as e:
+                    st.error(f"PDF creation failed: {str(e)}")
+            col_index += 1
+        
+        if DOCX_AVAILABLE:
+            with cols[col_index]:
+                # Word Document download
+                try:
+                    with st.spinner("Creating Word document..."):
+                        if word_settings.get('layout', 'single') == 'single':
+                            doc = create_word_document_single_column(
+                                st.session_state.processed_images,
+                                orientation=word_settings.get('orientation', 'portrait'),
+                                margins=word_settings.get('margins', 'normal')
+                            )
+                            layout_desc = "Single Column (Smart Page Splitting)"
+                        else:
+                            doc = create_word_document_two_column(
+                                st.session_state.processed_images,
+                                orientation=word_settings.get('orientation', 'portrait'),
+                                margins=word_settings.get('margins', 'normal')
+                            )
+                            layout_desc = "Two Column (Compact)"
+                        
+                        doc_buffer = io.BytesIO()
+                        doc.save(doc_buffer)
+                        doc_buffer.seek(0)
+                    
+                    st.download_button(
+                        label=f"📝 Download as Word ({layout_desc})",
+                        data=doc_buffer.getvalue(),
+                        file_name="processed_pages.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        use_container_width=True
+                    )
+                    st.caption(f"{layout_desc} - No gaps between images")
+                except Exception as e:
+                    st.error(f"Word export failed: {str(e)}")
+            col_index += 1
+        
+        # Reset button
+        if st.button("🔄 Process Another PDF", type="secondary"):
+            st.session_state.clear()
+            st.rerun()
+
+else:
+    # Welcome screen
+    st.info("👆 **Get Started:** Upload a PDF file in the sidebar")
+    
+    st.markdown("""
+    ## 🆕 PDF Image Processor 1.3
+    
+    ### 🎯 **Enhanced Logo Selection**
+    - **4 Rectangle Logos**: Standard rectangular areas
+    - **2 Freeform Polygon Logos**: Custom shapes for complex logos
+    - **🗺️ Grid Overlay**: Toggle grid lines for precise coordinate selection
+    - **🎯 Click Buttons**: Set logo areas at common positions
+    - **📐 Coordinate Boxes**: Manual precision editing  
+    - **👁️ Live Preview**: Real-time visual feedback with grid
+    - **⚡ Quick Actions**: Copy logos, reset positions, auto-space
+    
+    ### 🌐 **High Quality Processing**
+    - **300 DPI processing**: Maintains original image quality
+    - **PNG format**: No quality loss during processing
+    - **High-resolution output**: Crisp, clear results
+    
+    ### 📝 **Enhanced Word Export**
+    - **Single Column Layout**: Maximum width images
+    - **Smart Page Splitting**: Images split across pages when needed
+    - **Two Column Option**: Compact layout option
+    - **No gaps**: Professional document formatting
+    
+    ### 📄 **PDF Export**
+    - **Exact size pages**: PDF pages match your cropped image sizes exactly
+    - **No margins**: No white borders around your content
+    - **High quality**: PNG-based PDF creation
+    """)
+    
+    if not REPORTLAB_AVAILABLE:
+        st.warning("""
+        **To enable PDF export:**
+        ```bash
+        pip install reportlab
+        ```
+        """)
+    
+    if not DOCX_AVAILABLE:
+        st.warning("""
+        **To enable Word export:**
+        ```bash
+        pip install python-docx
+        ```
+        """)
+
+st.markdown("---")
+st.caption("PDF Image Processor 1.3 | High Quality + Single Column Word + Smart Page Splitting")
