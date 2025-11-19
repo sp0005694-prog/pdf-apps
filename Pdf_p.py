@@ -401,7 +401,6 @@ def visual_logo_selection(image, logo_states):
                                     st.session_state[f'polygon{i}_point{point_idx}_x'] = 100 + point_idx * 20
                                     st.session_state[f'polygon{i}_point{point_idx}_y'] = 100 + point_idx * 15
                     st.rerun()
-            
             with action_cols[2]:
     if st.button("🎯 Auto-Space Logos", use_container_width=True):
         img_w, img_h = image.width, image.height
